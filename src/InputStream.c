@@ -46,6 +46,7 @@ typedef struct _PACKET_HOLDER {
         NV_SCROLL_PACKET scroll;
         NV_HAPTICS_PACKET haptics;
         NV_UNICODE_PACKET unicode;
+        NV_LUTENPACK_PACKET lutenPack;
     } packet;
 } PACKET_HOLDER, *PPACKET_HOLDER;
 
