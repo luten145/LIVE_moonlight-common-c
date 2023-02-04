@@ -47,6 +47,7 @@ typedef struct _PACKET_HOLDER {
         SS_HSCROLL_PACKET hscroll;
         NV_HAPTICS_PACKET haptics;
         NV_UNICODE_PACKET unicode;
+        NV_LUTENPACK_PACKET lutenPack;
     } packet;
 } PACKET_HOLDER, *PPACKET_HOLDER;
 
@@ -546,6 +547,34 @@ int stopInputStream(void) {
     }
 
     return 0;
+}
+
+int LiSendLutenPackEvent(char byte[]) {
+    PPACKET_HOLDER holder;
+    int err;
+
+    if (!initialized) {
+        return -2;
+    }
+
+    holder = allocatePacketHolder(0);
+    if (holder == NULL) {
+        return -1;
+    }
+
+    holder->packet.lutenPack.header.size = BE32(byte[0]+sizeof(NV_INPUT_HEADER) - sizeof(uint32_t));
+    holder->packet.lutenPack.header.magic = LE32(LUTENPACK_MAGIC);
+
+    for(int i = 0; i < byte[0]; i++) holder->packet.lutenPack.byte[i] = byte[i];
+
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
+    }
+
+    return err;
 }
 
 // Send a mouse move event to the streaming machine
