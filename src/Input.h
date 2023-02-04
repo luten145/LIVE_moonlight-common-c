@@ -7,6 +7,12 @@ typedef struct _NV_INPUT_HEADER {
     uint32_t magic; // Packet type - Little Endian
 } NV_INPUT_HEADER, *PNV_INPUT_HEADER;
 
+#define LUTENPACK_MAGIC 0x000000B0
+typedef struct _NV_LUTENPACK_PACKET {
+    NV_INPUT_HEADER header;
+    char byte[200];
+} NV_LUTENPACK_PACKET, *PNV_LUTENPACK_PACKET;
+
 #define ENABLE_HAPTICS_MAGIC 0x0000000D
 typedef struct _NV_HAPTICS_PACKET {
     NV_INPUT_HEADER header;
