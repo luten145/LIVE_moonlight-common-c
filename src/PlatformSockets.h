@@ -2,6 +2,15 @@
 
 #include "Limelight.h"
 #include "Platform.h"
+#ifdef __3DS__
+#include <netinet/in.h>
+
+#ifdef AF_INET6
+#undef AF_INET6
+#endif
+
+extern in_port_t n3ds_udp_port;
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -68,9 +77,11 @@ typedef socklen_t SOCKADDR_LEN;
 
 #ifdef AF_INET6
 typedef struct sockaddr_in6 LC_SOCKADDR;
+#define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
 #define SET_PORT(addr, port) ((addr)->sin6_port = htons(port))
 #else
 typedef struct sockaddr_in LC_SOCKADDR;
+#define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
 #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
 #endif
 
@@ -82,12 +93,16 @@ typedef struct sockaddr_in LC_SOCKADDR;
 #else
 #define URLSAFESTRING_LEN INET_ADDRSTRLEN
 #endif
-void addrToUrlSafeString(struct sockaddr_storage* addr, char* string);
+void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t stringLength);
+
+#define SOCK_QOS_TYPE_BEST_EFFORT 0
+#define SOCK_QOS_TYPE_AUDIO 1
+#define SOCK_QOS_TYPE_VIDEO 2
 
 SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking);
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec);
 int sendMtuSafe(SOCKET s, char* buffer, int size);
-SOCKET bindUdpSocket(int addrfamily, int bufferSize);
+SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCKADDR_LEN addrLen, int bufferSize, int socketQosType);
 int enableNoDelay(SOCKET s);
 int setSocketNonBlocking(SOCKET s, bool enabled);
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect);
@@ -95,6 +110,7 @@ void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
 void closeSocket(SOCKET s);
 bool isPrivateNetworkAddress(struct sockaddr_storage* address);
+bool isNat64SynthesizedAddress(struct sockaddr_storage* address);
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs);
 bool isSocketReadable(SOCKET s);
 

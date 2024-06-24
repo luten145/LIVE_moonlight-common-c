@@ -9,7 +9,8 @@ static int terminationCallbackErrorCode;
 // Common globals
 char* RemoteAddrString;
 struct sockaddr_storage RemoteAddr;
-SOCKADDR_LEN RemoteAddrLen;
+struct sockaddr_storage LocalAddr;
+SOCKADDR_LEN AddrLen;
 int AppVersionQuad[4];
 STREAM_CONFIGURATION StreamConfig;
 CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
@@ -21,7 +22,6 @@ bool HighQualitySurroundSupported;
 bool HighQualitySurroundEnabled;
 OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
 OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
-int OriginalVideoBitrate;
 int AudioPacketDuration;
 bool AudioEncryptionEnabled;
 bool ReferenceFrameInvalidationSupported;
@@ -31,7 +31,11 @@ uint16_t AudioPortNumber;
 uint16_t VideoPortNumber;
 SS_PING AudioPingPayload;
 SS_PING VideoPingPayload;
+uint32_t ControlConnectData;
 uint32_t SunshineFeatureFlags;
+uint32_t EncryptionFeaturesSupported;
+uint32_t EncryptionFeaturesRequested;
+uint32_t EncryptionFeaturesEnabled;
 
 // Connection stages
 static const char* stageNames[STAGE_MAX] = {
@@ -171,8 +175,8 @@ static void ClInternalConnectionTerminated(int errorCode)
         LC_ASSERT(err == 0);
     }
 
-    // Close the thread handle since we can never wait on it
-    PltCloseThread(&terminationCallbackThread);
+    // Detach the thread since we never wait on it
+    PltDetachThread(&terminationCallbackThread);
 }
 
 static bool parseRtspPortNumberFromUrl(const char* rtspSessionUrl, uint16_t* port)
@@ -254,9 +258,9 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memcpy(&ListenerCallbacks, clCallbacks, sizeof(ListenerCallbacks));
     ListenerCallbacks.connectionTerminated = ClInternalConnectionTerminated;
 
+    memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
-    OriginalVideoBitrate = streamConfig->bitrate;
     RemoteAddrString = strdup(serverInfo->address);
 
     // The values in RTSP SETUP will be used to populate these.
@@ -344,13 +348,13 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     if (RtspPortNumber != 48010) {
         // If we have an alternate RTSP port, use that as our test port. The host probably
         // isn't listening on 47989 or 47984 anyway, since they're using alternate ports.
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, RtspPortNumber, &RemoteAddr, &RemoteAddrLen);
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, RtspPortNumber, &RemoteAddr, &AddrLen);
         if (err != 0) {
             // Sleep for a second and try again. It's possible that we've attempt to connect
             // before the host has gotten around to listening on the RTSP port. Give it some
             // time before retrying.
             PltSleepMs(1000);
-            err = resolveHostName(serverInfo->address, AF_UNSPEC, RtspPortNumber, &RemoteAddr, &RemoteAddrLen);
+            err = resolveHostName(serverInfo->address, AF_UNSPEC, RtspPortNumber, &RemoteAddr, &AddrLen);
         }
     }
     else {
@@ -360,12 +364,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         // TCP 48010 is a last resort because:
         // a) it's not always listening and there's a race between listen() on the host and our connect()
         // b) it's not used at all by certain host versions which perform RTSP over ENet
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 47984, &RemoteAddr, &RemoteAddrLen);
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, 47984, &RemoteAddr, &AddrLen);
         if (err != 0) {
-            err = resolveHostName(serverInfo->address, AF_UNSPEC, 47989, &RemoteAddr, &RemoteAddrLen);
+            err = resolveHostName(serverInfo->address, AF_UNSPEC, 47989, &RemoteAddr, &AddrLen);
         }
         if (err != 0) {
-            err = resolveHostName(serverInfo->address, AF_UNSPEC, 48010, &RemoteAddr, &RemoteAddrLen);
+            err = resolveHostName(serverInfo->address, AF_UNSPEC, 48010, &RemoteAddr, &AddrLen);
         }
     }
     if (err != 0) {
@@ -382,17 +386,27 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     // now that we have resolved the target address and impose the video packet
     // size cap if required.
     if (StreamConfig.streamingRemotely == STREAM_CFG_AUTO) {
-        if (isPrivateNetworkAddress(&RemoteAddr)) {
+        bool isNat64 = isNat64SynthesizedAddress(&RemoteAddr);
+
+        // It's possible to have a NAT64 prefix on a ULA or other private range,
+        // so we must exclude NAT64 addresses from our local address checks.
+        if (!isNat64 && isPrivateNetworkAddress(&RemoteAddr)) {
             StreamConfig.streamingRemotely = STREAM_CFG_LOCAL;
         }
         else {
             StreamConfig.streamingRemotely = STREAM_CFG_REMOTE;
 
-            if (StreamConfig.packetSize > 1024) {
-                // Cap packet size at 1024 for remote streaming to avoid
-                // MTU problems and fragmentation.
-                Limelog("Packet size capped at 1KB for remote streaming\n");
+            if (RemoteAddr.ss_family == AF_INET || isNat64) {
+                // Cap packet size at 1024 for remote IPv4 streaming to avoid fragmentation.
+                Limelog("Packet size capped at 1024 bytes for remote IPv4 streaming\n");
                 StreamConfig.packetSize = 1024;
+            }
+            else {
+                // IPv6 guarantees a minimum MTU of 1280 before fragmentation, so use a higher
+                // packet size cap for remote IPv6 streaming (when not using NAT64 which isn't
+                // end-to-end IPv6 traffic).
+                Limelog("Packet size capped at 1184 bytes for remote IPv6 streaming\n");
+                StreamConfig.packetSize = 1184;
             }
         }
     }
@@ -518,4 +532,10 @@ Cleanup:
         LiStopConnection();
     }
     return err;
+}
+
+const char* LiGetLaunchUrlQueryParameters(void) {
+    // v0 = Video encryption and control stream encryption v2
+    // v1 = RTSP encryption
+    return "&corever=1";
 }
