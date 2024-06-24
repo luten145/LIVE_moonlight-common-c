@@ -34,6 +34,7 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint32_t fecPercentage;
     uint32_t nextContiguousSequenceNumber;
     uint32_t missingPackets; // # of holes behind receivedHighestSequenceNumber
+    bool useFastQueuePath;
     bool reportedLostFrame;
 
     uint32_t currentFrameNumber;
@@ -52,4 +53,5 @@ typedef struct _RTP_VIDEO_QUEUE {
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
+uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);

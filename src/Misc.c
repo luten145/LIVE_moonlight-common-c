@@ -9,6 +9,10 @@
 static int serviceEnetHostInternal(ENetHost* client, ENetEvent* event, enet_uint32 timeoutMs, bool ignoreInterrupts) {
     int ret;
 
+    // Clear the last socket error to ensure the caller doesn't read a stale error upon a
+    // failure in non-socket-related processing in enet_host_service()
+    SetLastSocketError(0);
+
     // We need to call enet_host_service() multiple times to make sure retransmissions happen
     for (;;) {
         int selectedTimeout = timeoutMs < ENET_INTERNAL_TIMEOUT_MS ? timeoutMs : ENET_INTERNAL_TIMEOUT_MS;
@@ -16,6 +20,7 @@ static int serviceEnetHostInternal(ENetHost* client, ENetEvent* event, enet_uint
         // We want to report an interrupt event if we are able to read data
         if (!ignoreInterrupts && ConnectionInterrupted) {
             Limelog("ENet wait interrupted\n");
+            SetLastSocketError(EINTR);
             ret = -1;
             break;
         }
@@ -67,7 +72,7 @@ int gracefullyDisconnectEnetPeer(ENetHost* host, ENetPeer* peer, enet_uint32 lin
             Limelog("Timed out waiting for ENet peer to acknowledge disconnection\n");
         }
         else {
-            Limelog("Failed to receive ENet peer disconnection acknowledgement\n");
+            Limelog("Failed to receive ENet peer disconnection acknowledgement: %d\n", LastSocketFail());
         }
 
         return -1;
@@ -80,32 +85,19 @@ int gracefullyDisconnectEnetPeer(ENetHost* host, ENetPeer* peer, enet_uint32 lin
 }
 
 int extractVersionQuadFromString(const char* string, int* quad) {
-    char versionString[128];
-    char* nextDot;
-    char* nextNumber;
-    int i;
-    
-    strcpy(versionString, string);
-    nextNumber = versionString;
-    
-    for (i = 0; i < 4; i++) {
-        if (i == 3) {
-            nextDot = strchr(nextNumber, '\0');
+    const char* nextNumber = string;
+    for (int i = 0; i < 4; i++) {
+        // Parse the next component
+        quad[i] = (int)strtol(nextNumber, (char**)&nextNumber, 10);
+
+        // Skip the dot if we still have version components left.
+        //
+        // We continue looping even when we're at the end of the
+        // input string to ensure all subsequent version components
+        // are zeroed.
+        if (*nextNumber != 0) {
+            nextNumber++;
         }
-        else {
-            nextDot = strchr(nextNumber, '.');
-        }
-        if (nextDot == NULL) {
-            return -1;
-        }
-        
-        // Cut the string off at the next dot
-        *nextDot = '\0';
-        
-        quad[i] = atoi(nextNumber);
-        
-        // Move on to the next segment
-        nextNumber = nextDot + 1;
     }
     
     return 0;
@@ -154,4 +146,8 @@ void LiInitializeServerInformation(PSERVER_INFORMATION serverInfo) {
 
 uint64_t LiGetMillis(void) {
     return PltGetMillis();
+}
+
+uint32_t LiGetHostFeatureFlags(void) {
+    return SunshineFeatureFlags;
 }

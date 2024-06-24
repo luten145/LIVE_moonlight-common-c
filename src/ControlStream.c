@@ -28,8 +28,8 @@ typedef struct _NVCTL_ENCRYPTED_PACKET_HEADER {
 } NVCTL_ENCRYPTED_PACKET_HEADER, *PNVCTL_ENCRYPTED_PACKET_HEADER;
 
 typedef struct _QUEUED_FRAME_INVALIDATION_TUPLE {
-    int startFrame;
-    int endFrame;
+    uint32_t startFrame;
+    uint32_t endFrame;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_FRAME_INVALIDATION_TUPLE, *PQUEUED_FRAME_INVALIDATION_TUPLE;
 
@@ -37,6 +37,34 @@ typedef struct _QUEUED_FRAME_FEC_STATUS {
     SS_FRAME_FEC_STATUS fecStatus;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_FRAME_FEC_STATUS, *PQUEUED_FRAME_FEC_STATUS;
+
+typedef struct _QUEUED_ASYNC_CALLBACK {
+    int typeIndex;
+    union {
+        struct {
+            uint16_t controllerNumber;
+            uint16_t lowFreqRumble;
+            uint16_t highFreqRumble;
+        } rumble;
+        struct {
+            uint16_t controllerNumber;
+            uint16_t leftTriggerMotor;
+            uint16_t rightTriggerMotor;
+        } rumbleTriggers;
+        struct {
+            uint16_t controllerNumber;
+            uint16_t reportRateHz;
+            uint8_t motionType;
+        } setMotionEventState;
+        struct {
+            uint16_t controllerNumber;
+            uint8_t r;
+            uint8_t g;
+            uint8_t b;
+        } setControllerLed;
+    } data;
+    LINKED_BLOCKING_QUEUE_ENTRY entry;
+} QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
 
 static SOCKET ctlSock = INVALID_SOCKET;
 static ENetHost* client;
@@ -48,9 +76,9 @@ static PLT_THREAD lossStatsThread;
 static PLT_THREAD invalidateRefFramesThread;
 static PLT_THREAD requestIdrFrameThread;
 static PLT_THREAD controlReceiveThread;
-static int lossCountSinceLastReport;
-static int lastGoodFrame;
-static int lastSeenFrame;
+static PLT_THREAD asyncCallbackThread;
+static uint32_t lastGoodFrame;
+static uint32_t lastSeenFrame;
 static bool stopping;
 static bool disconnectPending;
 static bool encryptedControlStream;
@@ -62,10 +90,12 @@ static int intervalTotalFrameCount;
 static uint64_t intervalStartTimeMs;
 static int lastIntervalLossPercentage;
 static int lastConnectionStatusUpdate;
-static int currentEnetSequenceNumber;
+static uint32_t currentEnetSequenceNumber;
+static uint64_t firstFrameTimeMs;
 
 static LINKED_BLOCKING_QUEUE invalidReferenceFrameTuples;
 static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
+static LINKED_BLOCKING_QUEUE asyncCallbackQueue;
 static PLT_EVENT idrFrameRequiredEvent;
 
 static PPLT_CRYPTO_CONTEXT encryptionCtx;
@@ -242,7 +272,7 @@ static char**preconstructedPayloads;
 static bool supportsIdrFrameRequest;
 
 #define LOSS_REPORT_INTERVAL_MS 50
-#define PERIODIC_PING_INTERVAL_MS 250
+#define PERIODIC_PING_INTERVAL_MS 100
 
 // Initializes the control stream
 int initializeControlStream(void) {
@@ -250,6 +280,7 @@ int initializeControlStream(void) {
     PltCreateEvent(&idrFrameRequiredEvent);
     LbqInitializeLinkedBlockingQueue(&invalidReferenceFrameTuples, 20);
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
+    LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
@@ -289,13 +320,13 @@ int initializeControlStream(void) {
 
     lastGoodFrame = 0;
     lastSeenFrame = 0;
-    lossCountSinceLastReport = 0;
     disconnectPending = false;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
     intervalStartTimeMs = 0;
     lastIntervalLossPercentage = 0;
     lastConnectionStatusUpdate = CONN_STATUS_OKAY;
+    firstFrameTimeMs = 0;
     currentEnetSequenceNumber = 0;
     usePeriodicPing = APP_VERSION_AT_LEAST(7, 1, 415);
     encryptionCtx = PltCreateCryptoContext();
@@ -324,13 +355,14 @@ void destroyControlStream(void) {
     PltCloseEvent(&idrFrameRequiredEvent);
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&invalidReferenceFrameTuples));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
-    
+    freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
+
     PltDeleteMutex(&enetMutex);
 }
 
-void queueFrameInvalidationTuple(int startFrame, int endFrame) {
+static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
     LC_ASSERT(startFrame <= endFrame);
-    
+
     if (isReferenceFrameInvalidationEnabled()) {
         PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
         qfit = malloc(sizeof(*qfit));
@@ -364,12 +396,12 @@ void LiRequestIdrFrame(void) {
 }
 
 // Invalidate reference frames lost by the network
-void connectionDetectedFrameLoss(int startFrame, int endFrame) {
+void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame) {
     queueFrameInvalidationTuple(startFrame, endFrame);
 }
 
 // When we receive a frame, update the number of our current frame
-void connectionReceivedCompleteFrame(int frameIndex) {
+void connectionReceivedCompleteFrame(uint32_t frameIndex) {
     lastGoodFrame = frameIndex;
     intervalGoodFrameCount++;
 }
@@ -379,7 +411,7 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
     if (!IS_SUNSHINE()) {
         return;
     }
-    
+
     // Queue a frame FEC status message. This is best-effort only.
     PQUEUED_FRAME_FEC_STATUS queuedFecStatus = malloc(sizeof(*queuedFecStatus));
     if (queuedFecStatus != NULL) {
@@ -390,10 +422,23 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
     }
 }
 
-void connectionSawFrame(int frameIndex) {
-    LC_ASSERT(!isBefore16(frameIndex, lastSeenFrame));
+void connectionSawFrame(uint32_t frameIndex) {
+    LC_ASSERT_VT(!isBefore16(frameIndex, lastSeenFrame));
 
     uint64_t now = PltGetMillis();
+
+    // Suppress connection status warnings for the first sampling period
+    // to allow the network and host to settle.
+    if (lastSeenFrame == 0) {
+        lastSeenFrame = frameIndex;
+        firstFrameTimeMs = now;
+        return;
+    }
+    else if (now - firstFrameTimeMs < CONN_STATUS_SAMPLE_PERIOD) {
+        lastSeenFrame = frameIndex;
+        return;
+    }
+
     if (now - intervalStartTimeMs >= CONN_STATUS_SAMPLE_PERIOD) {
         if (intervalTotalFrameCount != 0) {
             // Notify the client of connection status changes based on frame loss rate
@@ -421,11 +466,6 @@ void connectionSawFrame(int frameIndex) {
 
     intervalTotalFrameCount += frameIndex - lastSeenFrame;
     lastSeenFrame = frameIndex;
-}
-
-// When we lose packets, update our packet loss count
-void connectionLostPackets(int lastReceivedPacket, int nextReceivedPacket) {
-    lossCountSinceLastReport += (nextReceivedPacket - lastReceivedPacket) - 1;
 }
 
 // Reads an NV control stream packet from the TCP connection
@@ -461,11 +501,31 @@ static PNVCTL_TCP_PACKET_HEADER readNvctlPacketTcp(void) {
 
 static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVCTL_ENET_PACKET_HEADER_V2 packet) {
     unsigned char iv[16] = { 0 };
+    int ivSize;
     int encryptedSize = sizeof(*packet) + packet->payloadLength;
 
-    // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
     // NB: Setting the IV must happen while encPacket->seq is still in native byte-order!
-    iv[0] = (unsigned char)encPacket->seq;
+    if (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) {
+        // Populate the IV in little endian byte order
+        iv[3] = (unsigned char)(encPacket->seq >> 24);
+        iv[2] = (unsigned char)(encPacket->seq >> 16);
+        iv[1] = (unsigned char)(encPacket->seq >> 8);
+        iv[0] = (unsigned char)(encPacket->seq >> 0);
+
+        // Set high bytes to something unique to ensure no IV collisions
+        iv[10] = (unsigned char)'C'; // Client originated
+        iv[11] = (unsigned char)'C'; // Control stream
+
+        // Use 12-byte IV which is ideal for AES-GCM
+        ivSize = 12;
+    }
+    else {
+        // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
+        iv[0] = (unsigned char)encPacket->seq;
+
+        // Nvidia's old style encryption uses a 16-byte IV
+        ivSize = 16;
+    }
 
     encPacket->encryptedHeaderType = LE16(encPacket->encryptedHeaderType);
     encPacket->length = LE16(encPacket->length);
@@ -474,9 +534,11 @@ static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVC
     packet->type = LE16(packet->type);
     packet->payloadLength = LE16(packet->payloadLength);
 
+    LC_ASSERT(ivSize <= (int)sizeof(iv));
+    LC_ASSERT(ivSize == 12 || ivSize == 16);
     return PltEncryptMessage(encryptionCtx, ALGORITHM_AES_GCM, 0,
                              (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
-                             iv, sizeof(iv),
+                             iv, ivSize,
                              (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // Write tag into the space after the encrypted header
                              (unsigned char*)packet, encryptedSize,
                              ((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH, &encryptedSize); // Write ciphertext after the GCM tag
@@ -485,6 +547,7 @@ static bool encryptControlMessage(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, PNVC
 // Caller must free() *packet on success!!!
 static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, int encPacketLength, PNVCTL_ENET_PACKET_HEADER_V1* packet, int* packetLength) {
     unsigned char iv[16] = { 0 };
+    int ivSize;
 
     *packet = NULL;
 
@@ -505,8 +568,27 @@ static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, 
         return false;
     }
 
-    // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
-    iv[0] = (unsigned char)encPacket->seq;
+    if (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) {
+        // Populate the IV in little endian byte order
+        iv[3] = (unsigned char)(encPacket->seq >> 24);
+        iv[2] = (unsigned char)(encPacket->seq >> 16);
+        iv[1] = (unsigned char)(encPacket->seq >> 8);
+        iv[0] = (unsigned char)(encPacket->seq >> 0);
+
+        // Set high bytes to something unique to ensure no IV collisions
+        iv[10] = (unsigned char)'H'; // Host originated
+        iv[11] = (unsigned char)'C'; // Control stream
+
+        // Use 12-byte IV which is ideal for AES-GCM
+        ivSize = 12;
+    }
+    else {
+        // This is a truncating cast, but it's what Nvidia does, so we have to mimic it.
+        iv[0] = (unsigned char)encPacket->seq;
+
+        // Nvidia's old style encryption uses a 16-byte IV
+        ivSize = 16;
+    }
 
     int plaintextLength = encPacket->length - sizeof(encPacket->seq) - AES_GCM_TAG_LENGTH;
     *packet = malloc(plaintextLength);
@@ -514,9 +596,11 @@ static bool decryptControlMessageToV1(PNVCTL_ENCRYPTED_PACKET_HEADER encPacket, 
         return false;
     }
 
+    LC_ASSERT(ivSize <= (int)sizeof(iv));
+    LC_ASSERT(ivSize == 12 || ivSize == 16);
     if (!PltDecryptMessage(decryptionCtx, ALGORITHM_AES_GCM, 0,
                            (unsigned char*)StreamConfig.remoteInputAesKey, sizeof(StreamConfig.remoteInputAesKey),
-                           iv, sizeof(iv),
+                           iv, ivSize,
                            (unsigned char*)(encPacket + 1), AES_GCM_TAG_LENGTH, // The tag is located right after the header
                            ((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH, plaintextLength, // The ciphertext is after the tag
                            (unsigned char*)*packet, &plaintextLength)) {
@@ -559,7 +643,7 @@ static bool isPacketSentWaitingForAck(ENetPacket* packet) {
     return false;
 }
 
-static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags) {
+static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     ENetPacket* enetPacket;
     int err;
 
@@ -634,43 +718,38 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     // the peer's supported channel count.
     if (!IS_SUNSHINE() || channelId >= peer->channelCount) {
         channelId = 0;
-
-        // Send unreliable traffic as reliable if we only have one channel.
-        // This avoids unwanted sequencing between reliable and unreliable
-        // traffic that can lead to delays.
-        if (flags == 0) {
-            flags |= ENET_PACKET_FLAG_RELIABLE;
-            enetPacket->flags |= ENET_PACKET_FLAG_RELIABLE;
-        }
     }
 
     // Queue the packet to be sent
     err = enet_peer_send(peer, channelId, enetPacket);
+    bool packetQueued = (err == 0);
 
-    // Wait until the packet is actually sent to provide backpressure on senders
-    if (err == 0 && (flags & ENET_PACKET_FLAG_RELIABLE)) {
-        // Try to send the packet
-        enet_host_service(client, NULL, 0);
+    // If there is no more data coming soon, send the packet now
+    if (!moreData && packetQueued) {
+        err = enet_host_service(client, NULL, 0);
 
-        // Don't wait longer than 10 milliseconds to avoid blocking callers for too long
-        for (int i = 0; i < 10; i++) {
-            // Break on disconnected, acked/freed, or sent (pending ack).
-            if (peer->state != ENET_PEER_STATE_CONNECTED || packetFreed || isPacketSentWaitingForAck(enetPacket)) {
-                break;
+        // Wait until the packet is actually sent to provide backpressure on senders
+        if (flags & ENET_PACKET_FLAG_RELIABLE) {
+            // Don't wait longer than 10 milliseconds to avoid blocking callers for too long
+            for (int i = 0; err >= 0 && i < 10; i++) {
+                // Break on disconnected, acked/freed, or sent (pending ack).
+                if (peer->state != ENET_PEER_STATE_CONNECTED || packetFreed || isPacketSentWaitingForAck(enetPacket)) {
+                    break;
+                }
+
+                // Release the lock before sleeping to allow another thread to send/receive
+                PltUnlockMutex(&enetMutex);
+                PltSleepMs(1);
+                PltLockMutex(&enetMutex);
+
+                // Try to send the packet again
+                err = enet_host_service(client, NULL, 0);
             }
 
-            // Release the lock before sleeping to allow another thread to send/receive
-            PltUnlockMutex(&enetMutex);
-            PltSleepMs(1);
-            PltLockMutex(&enetMutex);
-
-            // Try to send the packet again
-            enet_host_service(client, NULL, 0);
-        }
-
-        if (peer->state == ENET_PEER_STATE_CONNECTED && !packetFreed && !isPacketSentWaitingForAck(enetPacket)) {
-            Limelog("Control message took over 10 ms to send (net latency: %u ms | packet loss: %f%%)\n",
-                    peer->roundTripTime, peer->packetLoss / (float)ENET_PEER_PACKET_LOSS_SCALE);
+            if (err >= 0 && peer->state == ENET_PEER_STATE_CONNECTED && !packetFreed && !isPacketSentWaitingForAck(enetPacket)) {
+                Limelog("Control message took over 10 ms to send (net latency: %u ms | packet loss: %f%%)\n",
+                        peer->roundTripTime, peer->packetLoss / (float)ENET_PEER_PACKET_LOSS_SCALE);
+            }
         }
     }
 
@@ -684,7 +763,9 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
 
     if (err < 0) {
         Limelog("Failed to send ENet control packet\n");
-        enet_packet_destroy(enetPacket);
+        if (!packetQueued) {
+            enet_packet_destroy(enetPacket);
+        }
         return false;
     }
 
@@ -716,13 +797,13 @@ static bool sendMessageTcp(short ptype, short paylen, const void* payload) {
     return true;
 }
 
-static bool sendMessageAndForget(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags) {
+static bool sendMessageAndForget(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     bool ret;
 
     // Unlike regular sockets, ENet sockets aren't safe to invoke from multiple
     // threads at once. We have to synchronize them with a lock.
     if (AppVersionQuad[0] >= 5) {
-        ret = sendMessageEnet(ptype, paylen, payload, channelId, flags);
+        ret = sendMessageEnet(ptype, paylen, payload, channelId, flags, moreData);
     }
     else {
         ret = sendMessageTcp(ptype, paylen, payload);
@@ -731,9 +812,9 @@ static bool sendMessageAndForget(short ptype, short paylen, const void* payload,
     return ret;
 }
 
-static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags) {
+static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {
     if (AppVersionQuad[0] >= 5) {
-        if (!sendMessageEnet(ptype, paylen, payload, channelId, flags)) {
+        if (!sendMessageEnet(ptype, paylen, payload, channelId, flags, moreData)) {
             return false;
         }
     }
@@ -775,6 +856,184 @@ static int ignoreDisconnectIntercept(ENetHost* host, ENetEvent* event) {
     }
 
     return 0;
+}
+
+static void asyncCallbackThreadFunc(void* context) {
+    PQUEUED_ASYNC_CALLBACK queuedCb, nextCb;
+
+    while (LbqWaitForQueueElement(&asyncCallbackQueue, (void**)&queuedCb) == LBQ_SUCCESS) {
+        switch (queuedCb->typeIndex) {
+        case IDX_RUMBLE_DATA:
+            // Look for another rumble packet to batch with
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS) {
+                // Don't batch with the next packet if it is a different type or controller number
+                if (nextCb->typeIndex != queuedCb->typeIndex ||
+                        nextCb->data.rumble.controllerNumber != queuedCb->data.rumble.controllerNumber) {
+                    break;
+                }
+
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.rumble(queuedCb->data.rumble.controllerNumber,
+                                     queuedCb->data.rumble.lowFreqRumble,
+                                     queuedCb->data.rumble.highFreqRumble);
+            break;
+        case IDX_RUMBLE_TRIGGER_DATA:
+            // Look for another rumble triggers packet to batch with
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS) {
+                // Don't batch with the next packet if it is a different type or controller number
+                if (nextCb->typeIndex != queuedCb->typeIndex ||
+                        nextCb->data.rumbleTriggers.controllerNumber != queuedCb->data.rumbleTriggers.controllerNumber) {
+                    break;
+                }
+
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.rumbleTriggers(queuedCb->data.rumbleTriggers.controllerNumber,
+                                             queuedCb->data.rumbleTriggers.leftTriggerMotor,
+                                             queuedCb->data.rumbleTriggers.rightTriggerMotor);
+            break;
+        case IDX_SET_RGB_LED:
+            // Look for another controller LED packet to batch with
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS) {
+                // Don't batch with the next packet if it is a different type or controller number
+                if (nextCb->typeIndex != queuedCb->typeIndex ||
+                        nextCb->data.setControllerLed.controllerNumber != queuedCb->data.setControllerLed.controllerNumber) {
+                    break;
+                }
+
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.setControllerLED(queuedCb->data.setControllerLed.controllerNumber,
+                                               queuedCb->data.setControllerLed.r,
+                                               queuedCb->data.setControllerLed.g,
+                                               queuedCb->data.setControllerLed.b);
+            break;
+        case IDX_HDR_INFO:
+            // HDR state is maintained globally, so we just invoke the client callback here.
+            // These events are stateless, so we can consume all of them now.
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS && nextCb->typeIndex == queuedCb->typeIndex) {
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.setHdrMode(hdrEnabled);
+            break;
+
+        case IDX_SET_MOTION_EVENT:
+            // These events are infrequent and cannot be batched
+            ListenerCallbacks.setMotionEventState(queuedCb->data.setMotionEventState.controllerNumber,
+                                                  queuedCb->data.setMotionEventState.motionType,
+                                                  queuedCb->data.setMotionEventState.reportRateHz);
+            break;
+        default:
+            // Unhandled packet type from queueAsyncCallback()
+            LC_ASSERT(false);
+            break;
+        }
+
+        free(queuedCb);
+    }
+}
+
+static bool needsAsyncCallback(unsigned short packetType) {
+    return packetType == packetTypes[IDX_RUMBLE_DATA] ||
+           packetType == packetTypes[IDX_RUMBLE_TRIGGER_DATA] ||
+           packetType == packetTypes[IDX_SET_MOTION_EVENT] ||
+           packetType == packetTypes[IDX_SET_RGB_LED] ||
+           packetType == packetTypes[IDX_HDR_INFO];
+}
+
+static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    BYTE_BUFFER bb;
+    PQUEUED_ASYNC_CALLBACK queuedCb;
+    int err;
+
+    LC_ASSERT(needsAsyncCallback(ctlHdr->type));
+
+    queuedCb = malloc(sizeof(*queuedCb));
+    if (!queuedCb) {
+        return;
+    }
+
+    BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
+
+    if (ctlHdr->type == packetTypes[IDX_RUMBLE_DATA]) {
+        BbAdvanceBuffer(&bb, 4);
+
+        BbGet16(&bb, &queuedCb->data.rumble.controllerNumber);
+        BbGet16(&bb, &queuedCb->data.rumble.lowFreqRumble);
+        BbGet16(&bb, &queuedCb->data.rumble.highFreqRumble);
+
+        queuedCb->typeIndex = IDX_RUMBLE_DATA;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_RUMBLE_TRIGGER_DATA]) {
+        BbGet16(&bb, &queuedCb->data.rumbleTriggers.controllerNumber);
+        BbGet16(&bb, &queuedCb->data.rumbleTriggers.leftTriggerMotor);
+        BbGet16(&bb, &queuedCb->data.rumbleTriggers.rightTriggerMotor);
+
+        queuedCb->typeIndex = IDX_RUMBLE_TRIGGER_DATA;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_SET_MOTION_EVENT]) {
+        BbGet16(&bb, &queuedCb->data.setMotionEventState.controllerNumber);
+        BbGet16(&bb, &queuedCb->data.setMotionEventState.reportRateHz);
+        BbGet8(&bb, &queuedCb->data.setMotionEventState.motionType);
+
+        queuedCb->typeIndex = IDX_SET_MOTION_EVENT;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_SET_RGB_LED]) {
+        BbGet16(&bb, &queuedCb->data.setControllerLed.controllerNumber);
+        BbGet8(&bb, &queuedCb->data.setControllerLed.r);
+        BbGet8(&bb, &queuedCb->data.setControllerLed.g);
+        BbGet8(&bb, &queuedCb->data.setControllerLed.b);
+
+        queuedCb->typeIndex = IDX_SET_RGB_LED;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_HDR_INFO]) {
+        queuedCb->typeIndex = IDX_HDR_INFO;
+    }
+    else {
+        // Unhandled packet type from needsAsyncCallback()
+        LC_ASSERT(false);
+        free(queuedCb);
+        return;
+    }
+
+    err = LbqOfferQueueItem(&asyncCallbackQueue, queuedCb, &queuedCb->entry);
+    if (err != LBQ_SUCCESS) {
+        Limelog("Failed to queue async callback: %d\n", err);
+        free(queuedCb);
+    }
 }
 
 static void controlReceiveThreadFunc(void* context) {
@@ -856,6 +1115,10 @@ static void controlReceiveThreadFunc(void* context) {
         }
 
         if (err < 0) {
+            // The error from serviceEnetHost() should be propagated via LastSocketError()
+            LC_ASSERT(err == -1);
+
+            err = LastSocketFail();
             Limelog("Control stream connection failed: %d\n", err);
             ListenerCallbacks.connectionTerminated(err);
             return;
@@ -903,10 +1166,10 @@ static void controlReceiveThreadFunc(void* context) {
                     ctlHdr->type = LE16(ctlHdr->type);
                 }
                 else {
-                    // What do we do here???
-                    LC_ASSERT(false);
-                    packetLength = (int)event.packet->dataLength;
-                    event.packet->data = NULL;
+                    LC_ASSERT_VT(false);
+                    Limelog("Discarding unencrypted packet on encrypted control stream: %04x\n", ctlHdr->type);
+                    enet_packet_destroy(event.packet);
+                    continue;
                 }
             }
             else {
@@ -920,68 +1183,9 @@ static void controlReceiveThreadFunc(void* context) {
 
             // All below codepaths must free ctlHdr!!!
 
-            if (ctlHdr->type == packetTypes[IDX_RUMBLE_DATA]) {
-                BYTE_BUFFER bb;
-
-                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
-                BbAdvanceBuffer(&bb, 4);
-
-                uint16_t controllerNumber;
-                uint16_t lowFreqRumble;
-                uint16_t highFreqRumble;
-
-                BbGet16(&bb, &controllerNumber);
-                BbGet16(&bb, &lowFreqRumble);
-                BbGet16(&bb, &highFreqRumble);
-
-                ListenerCallbacks.rumble(controllerNumber, lowFreqRumble, highFreqRumble);
-            }
-            else if (ctlHdr->type == packetTypes[IDX_RUMBLE_TRIGGER_DATA]) {
-                BYTE_BUFFER bb;
-
-                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
-
-                uint16_t controllerNumber;
-                uint16_t leftTriggerMotor;
-                uint16_t rightTriggerMotor;
-
-                BbGet16(&bb, &controllerNumber);
-                BbGet16(&bb, &leftTriggerMotor);
-                BbGet16(&bb, &rightTriggerMotor);
-
-                ListenerCallbacks.rumbleTriggers(controllerNumber, leftTriggerMotor, rightTriggerMotor);
-            }
-            else if (ctlHdr->type == packetTypes[IDX_SET_MOTION_EVENT]) {
-                BYTE_BUFFER bb;
-
-                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
-
-                uint16_t controllerNumber;
-                uint16_t reportRateHz;
-                uint8_t motionType;
-
-                BbGet16(&bb, &controllerNumber);
-                BbGet16(&bb, &reportRateHz);
-                BbGet8(&bb, &motionType);
-
-                ListenerCallbacks.setMotionEventState(controllerNumber, motionType, reportRateHz);
-            }
-            else if (ctlHdr->type == packetTypes[IDX_SET_RGB_LED]) {
-                BYTE_BUFFER bb;
-
-                BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
-
-                uint16_t controllerNumber;
-                uint8_t r, g, b;
-
-                BbGet16(&bb, &controllerNumber);
-                BbGet8(&bb, &r);
-                BbGet8(&bb, &g);
-                BbGet8(&bb, &b);
-
-                ListenerCallbacks.setControllerLED(controllerNumber, r, g, b);
-            }
-            else if (ctlHdr->type == packetTypes[IDX_HDR_INFO]) {
+            // Process HDR data immediately to update global HDR enabled state and HDR metadata.
+            // The actual client callback will be invoked in the async callback thread.
+            if (ctlHdr->type == packetTypes[IDX_HDR_INFO]) {
                 BYTE_BUFFER bb;
                 uint8_t enableByte;
 
@@ -1007,7 +1211,11 @@ static void controlReceiveThreadFunc(void* context) {
                 }
 
                 hdrEnabled = (enableByte != 0);
-                ListenerCallbacks.setHdrMode(hdrEnabled);
+            }
+
+            // Process client callbacks in a separate thread
+            if (needsAsyncCallback(ctlHdr->type)) {
+                queueAsyncCallback(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
                 BYTE_BUFFER bb;
@@ -1122,23 +1330,30 @@ static void lossStatsThreadFunc(void* context) {
                                          sizeof(queuedFrameStatus->fecStatus),
                                          &queuedFrameStatus->fecStatus,
                                          CTRL_CHANNEL_GENERIC,
-                                         ENET_PACKET_FLAG_UNSEQUENCED)) {
+                                         ENET_PACKET_FLAG_UNSEQUENCED,
+                                         LbqGetItemCount(&frameFecStatusQueue) > 0)) {
                         Limelog("Loss Stats: Sending frame FEC status message failed: %d\n", (int)LastSocketError());
                         ListenerCallbacks.connectionTerminated(LastSocketFail());
                         free(queuedFrameStatus);
                         return;
                     }
-                    
+
                     free(queuedFrameStatus);
                 }
             }
 
             // Send the message (and don't expect a response)
+            //
+            // NB: We send this periodic message as reliable to ensure the RTT is recomputed
+            // regularly. This only happens when an ACK is received to a reliable packet.
+            // Since the other traffic on this channel is unsequenced, it doesn't really
+            // cause any negative HOL blocking side-effects.
             if (!sendMessageAndForget(0x0200,
                                       sizeof(periodicPingPayload),
                                       periodicPingPayload,
                                       CTRL_CHANNEL_GENERIC,
-                                      0)) {
+                                      ENET_PACKET_FLAG_RELIABLE,
+                                      false)) {
                 Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
                 ListenerCallbacks.connectionTerminated(LastSocketFail());
                 return;
@@ -1150,7 +1365,7 @@ static void lossStatsThreadFunc(void* context) {
     }
     else {
         char* lossStatsPayload;
-        
+
         // Sunshine should use the newer codepath above
         LC_ASSERT(!IS_SUNSHINE());
 
@@ -1164,7 +1379,7 @@ static void lossStatsThreadFunc(void* context) {
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
             // Construct the payload
             BbInitializeWrappedBuffer(&byteBuffer, lossStatsPayload, 0, payloadLengths[IDX_LOSS_STATS], BYTE_ORDER_LITTLE);
-            BbPut32(&byteBuffer, lossCountSinceLastReport);
+            BbPut32(&byteBuffer, 0);
             BbPut32(&byteBuffer, LOSS_REPORT_INTERVAL_MS);
             BbPut32(&byteBuffer, 1000);
             BbPut64(&byteBuffer, lastGoodFrame);
@@ -1177,15 +1392,13 @@ static void lossStatsThreadFunc(void* context) {
                                       payloadLengths[IDX_LOSS_STATS],
                                       lossStatsPayload,
                                       CTRL_CHANNEL_GENERIC,
-                                      0)) {
+                                      0,
+                                      false)) {
                 free(lossStatsPayload);
                 Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
                 ListenerCallbacks.connectionTerminated(LastSocketFail());
                 return;
             }
-
-            // Clear the transient state
-            lossCountSinceLastReport = 0;
 
             // Wait a bit
             PltSleepMsInterruptible(&lossStatsThread, LOSS_REPORT_INTERVAL_MS);
@@ -1216,10 +1429,11 @@ static void requestIdrFrame(void) {
 
         // Send the reference frame invalidation request and read the response
         if (!sendMessageAndDiscardReply(packetTypes[IDX_INVALIDATE_REF_FRAMES],
-                                        payloadLengths[IDX_INVALIDATE_REF_FRAMES],
+                                        sizeof(payload),
                                         payload,
                                         CTRL_CHANNEL_URGENT,
-                                        ENET_PACKET_FLAG_RELIABLE)) {
+                                        ENET_PACKET_FLAG_RELIABLE,
+                                        false)) {
             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
             return;
@@ -1231,7 +1445,8 @@ static void requestIdrFrame(void) {
                                         payloadLengths[IDX_REQUEST_IDR_FRAME],
                                         preconstructedPayloads[IDX_REQUEST_IDR_FRAME],
                                         CTRL_CHANNEL_URGENT,
-                                        ENET_PACKET_FLAG_RELIABLE)) {
+                                        ENET_PACKET_FLAG_RELIABLE,
+                                        false)) {
             Limelog("Request IDR Frame: Transaction failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
             return;
@@ -1241,7 +1456,7 @@ static void requestIdrFrame(void) {
     Limelog("IDR frame request sent\n");
 }
 
-static void requestInvalidateReferenceFrames(int startFrame, int endFrame) {
+static void requestInvalidateReferenceFrames(uint32_t startFrame, uint32_t endFrame) {
     int64_t payload[3];
 
     LC_ASSERT(startFrame <= endFrame);
@@ -1253,9 +1468,10 @@ static void requestInvalidateReferenceFrames(int startFrame, int endFrame) {
 
     // Send the reference frame invalidation request and read the response
     if (!sendMessageAndDiscardReply(packetTypes[IDX_INVALIDATE_REF_FRAMES],
-                                    payloadLengths[IDX_INVALIDATE_REF_FRAMES],
+                                    sizeof(payload),
                                     payload, CTRL_CHANNEL_URGENT,
-                                    ENET_PACKET_FLAG_RELIABLE)) {
+                                    ENET_PACKET_FLAG_RELIABLE,
+                                    false)) {
         Limelog("Request Invaldiate Reference Frames: Transaction failed: %d\n", (int)LastSocketError());
         ListenerCallbacks.connectionTerminated(LastSocketFail());
         return;
@@ -1269,8 +1485,8 @@ static void invalidateRefFramesFunc(void* context) {
 
     while (!PltIsThreadInterrupted(&invalidateRefFramesThread)) {
         PQUEUED_FRAME_INVALIDATION_TUPLE qfit;
-        int startFrame;
-        int endFrame;
+        uint32_t startFrame;
+        uint32_t endFrame;
 
         // Wait for a reference frame invalidation request or a request to shutdown
         if (LbqWaitForQueueElement(&invalidReferenceFrameTuples, (void**)&qfit) != LBQ_SUCCESS) {
@@ -1316,6 +1532,7 @@ int stopControlStream(void) {
     stopping = true;
     LbqSignalQueueShutdown(&invalidReferenceFrameTuples);
     LbqSignalQueueShutdown(&frameFecStatusQueue);
+    LbqSignalQueueDrain(&asyncCallbackQueue);
     PltSetEvent(&idrFrameRequiredEvent);
 
     // This must be set to stop in a timely manner
@@ -1324,24 +1541,21 @@ int stopControlStream(void) {
     if (ctlSock != INVALID_SOCKET) {
         shutdownTcpSocket(ctlSock);
     }
-    
+
     PltInterruptThread(&lossStatsThread);
     PltInterruptThread(&requestIdrFrameThread);
     PltInterruptThread(&controlReceiveThread);
+    PltInterruptThread(&asyncCallbackThread);
 
     PltJoinThread(&lossStatsThread);
     PltJoinThread(&requestIdrFrameThread);
     PltJoinThread(&controlReceiveThread);
-
-    PltCloseThread(&lossStatsThread);
-    PltCloseThread(&requestIdrFrameThread);
-    PltCloseThread(&controlReceiveThread);
+    PltJoinThread(&asyncCallbackThread);
 
     // We will only have an RFI thread if RFI is enabled
     if (isReferenceFrameInvalidationEnabled()) {
         PltInterruptThread(&invalidateRefFramesThread);
         PltJoinThread(&invalidateRefFramesThread);
-        PltCloseThread(&invalidateRefFramesThread);
     }
 
     if (peer != NULL) {
@@ -1354,7 +1568,7 @@ int stopControlStream(void) {
         enet_host_destroy(client);
         client = NULL;
     }
-    
+
     if (ctlSock != INVALID_SOCKET) {
         closeSocket(ctlSock);
         ctlSock = INVALID_SOCKET;
@@ -1364,15 +1578,24 @@ int stopControlStream(void) {
 }
 
 // Called by the input stream to send a packet for Gen 5+ servers
-int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags) {
+int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData) {
     LC_ASSERT(AppVersionQuad[0] >= 5);
 
     // Send the input data (no reply expected)
-    if (sendMessageAndForget(packetTypes[IDX_INPUT_DATA], length, data, channelId, flags) == 0) {
+    if (sendMessageAndForget(packetTypes[IDX_INPUT_DATA], length, data, channelId, flags, moreData) == 0) {
         return -1;
     }
 
     return 0;
+}
+
+// Called by the input stream to flush queued packets before a batching wait
+void flushInputOnControlStream(void) {
+    if (AppVersionQuad[0] >= 5) {
+        PltLockMutex(&enetMutex);
+        enet_host_flush(client);
+        PltUnlockMutex(&enetMutex);
+    }
 }
 
 bool isControlDataInTransit(void) {
@@ -1414,16 +1637,26 @@ int startControlStream(void) {
     int err;
 
     if (AppVersionQuad[0] >= 5) {
-        ENetAddress address;
+        ENetAddress remoteAddress, localAddress;
         ENetEvent event;
-        
+
         LC_ASSERT(ControlPortNumber != 0);
 
-        enet_address_set_address(&address, (struct sockaddr *)&RemoteAddr, RemoteAddrLen);
-        enet_address_set_port(&address, ControlPortNumber);
+        enet_address_set_address(&localAddress, (struct sockaddr *)&LocalAddr, AddrLen);
+#ifdef __3DS__
+        // binding to wildcard port is broken on the 3DS, so we need to define a port manually
+        enet_address_set_port(&localAddress, htons(n3ds_udp_port++));
+#else
+        enet_address_set_port(&localAddress, 0); // Wildcard port
+#endif
+
+        enet_address_set_address(&remoteAddress, (struct sockaddr *)&RemoteAddr, AddrLen);
+        enet_address_set_port(&remoteAddress, ControlPortNumber);
 
         // Create a client
-        client = enet_host_create(address.address.ss_family, NULL, 1, CTRL_CHANNEL_COUNT, 0, 0);
+        client = enet_host_create(RemoteAddr.ss_family,
+                                  LocalAddr.ss_family != 0 ? &localAddress : NULL,
+                                  1, CTRL_CHANNEL_COUNT, 0, 0);
         if (client == NULL) {
             stopping = true;
             return -1;
@@ -1431,8 +1664,14 @@ int startControlStream(void) {
 
         client->intercept = ignoreDisconnectIntercept;
 
+        // Enable high priority QoS marking on control stream traffic
+        //
+        // NB: It is important to do this before connecting because there's logic in the connect
+        // retransmission code to detect QoS-intolerant routes and disable QoS marking for those.
+        enet_socket_set_option (client->socket, ENET_SOCKOPT_QOS, 1);
+
         // Connect to the host
-        peer = enet_host_connect(client, &address, CTRL_CHANNEL_COUNT, 0);
+        peer = enet_host_connect(client, &remoteAddress, CTRL_CHANNEL_COUNT, ControlConnectData);
         if (peer == NULL) {
             stopping = true;
             enet_host_destroy(client);
@@ -1474,14 +1713,20 @@ int startControlStream(void) {
 
         // Ensure the connect verify ACK is sent immediately
         enet_host_flush(client);
-        
+
+#ifdef __3DS__
+        // Set the peer timeout to 1 minute and limit backoff to 2x RTT
+        // The 3DS can take a bit longer to set up when starting fresh
+        enet_peer_timeout(peer, 2, 60000, 60000);
+#else
         // Set the peer timeout to 10 seconds and limit backoff to 2x RTT
         enet_peer_timeout(peer, 2, 10000, 10000);
+#endif
     }
     else {
         // NB: Do NOT use ControlPortNumber here. 47995 is correct for these old versions.
         LC_ASSERT(ControlPortNumber == 0);
-        ctlSock = connectTcpSocket(&RemoteAddr, RemoteAddrLen,
+        ctlSock = connectTcpSocket(&RemoteAddr, AddrLen,
             47995, CONTROL_STREAM_TIMEOUT_SEC);
         if (ctlSock == INVALID_SOCKET) {
             stopping = true;
@@ -1512,7 +1757,8 @@ int startControlStream(void) {
                                     payloadLengths[IDX_START_A],
                                     preconstructedPayloads[IDX_START_A],
                                     CTRL_CHANNEL_GENERIC,
-                                    ENET_PACKET_FLAG_RELIABLE)) {
+                                    ENET_PACKET_FLAG_RELIABLE,
+                                    false)) {
         Limelog("Start A failed: %d\n", (int)LastSocketError());
         err = LastSocketFail();
         stopping = true;
@@ -1526,7 +1772,6 @@ int startControlStream(void) {
 
         PltInterruptThread(&controlReceiveThread);
         PltJoinThread(&controlReceiveThread);
-        PltCloseThread(&controlReceiveThread);
 
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
@@ -1546,7 +1791,8 @@ int startControlStream(void) {
                                     payloadLengths[IDX_START_B],
                                     preconstructedPayloads[IDX_START_B],
                                     CTRL_CHANNEL_GENERIC,
-                                    ENET_PACKET_FLAG_RELIABLE)) {
+                                    ENET_PACKET_FLAG_RELIABLE,
+                                    false)) {
         Limelog("Start B failed: %d\n", (int)LastSocketError());
         err = LastSocketFail();
         stopping = true;
@@ -1560,7 +1806,6 @@ int startControlStream(void) {
 
         PltInterruptThread(&controlReceiveThread);
         PltJoinThread(&controlReceiveThread);
-        PltCloseThread(&controlReceiveThread);
 
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
@@ -1588,7 +1833,6 @@ int startControlStream(void) {
 
         PltInterruptThread(&controlReceiveThread);
         PltJoinThread(&controlReceiveThread);
-        PltCloseThread(&controlReceiveThread);
 
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
@@ -1616,11 +1860,44 @@ int startControlStream(void) {
 
         PltInterruptThread(&lossStatsThread);
         PltJoinThread(&lossStatsThread);
-        PltCloseThread(&lossStatsThread);
 
         PltInterruptThread(&controlReceiveThread);
         PltJoinThread(&controlReceiveThread);
-        PltCloseThread(&controlReceiveThread);
+
+        if (ctlSock != INVALID_SOCKET) {
+            closeSocket(ctlSock);
+            ctlSock = INVALID_SOCKET;
+        }
+        else {
+            enet_peer_disconnect_now(peer, 0);
+            peer = NULL;
+            enet_host_destroy(client);
+            client = NULL;
+        }
+
+        return err;
+    }
+
+    err = PltCreateThread("CtrlAsyncCb", asyncCallbackThreadFunc, NULL, &asyncCallbackThread);
+    if (err != 0) {
+        stopping = true;
+        PltSetEvent(&idrFrameRequiredEvent);
+
+        if (ctlSock != INVALID_SOCKET) {
+            shutdownTcpSocket(ctlSock);
+        }
+        else {
+            ConnectionInterrupted = true;
+        }
+
+        PltInterruptThread(&lossStatsThread);
+        PltJoinThread(&lossStatsThread);
+
+        PltInterruptThread(&controlReceiveThread);
+        PltJoinThread(&controlReceiveThread);
+
+        PltInterruptThread(&requestIdrFrameThread);
+        PltJoinThread(&requestIdrFrameThread);
 
         if (ctlSock != INVALID_SOCKET) {
             closeSocket(ctlSock);
@@ -1642,6 +1919,7 @@ int startControlStream(void) {
         if (err != 0) {
             stopping = true;
             PltSetEvent(&idrFrameRequiredEvent);
+            LbqSignalQueueShutdown(&asyncCallbackQueue);
 
             if (ctlSock != INVALID_SOCKET) {
                 shutdownTcpSocket(ctlSock);
@@ -1652,15 +1930,15 @@ int startControlStream(void) {
 
             PltInterruptThread(&lossStatsThread);
             PltJoinThread(&lossStatsThread);
-            PltCloseThread(&lossStatsThread);
 
             PltInterruptThread(&controlReceiveThread);
             PltJoinThread(&controlReceiveThread);
-            PltCloseThread(&controlReceiveThread);
 
             PltInterruptThread(&requestIdrFrameThread);
             PltJoinThread(&requestIdrFrameThread);
-            PltCloseThread(&requestIdrFrameThread);
+
+            PltInterruptThread(&asyncCallbackThread);
+            PltJoinThread(&asyncCallbackThread);
 
             if (ctlSock != INVALID_SOCKET) {
                 closeSocket(ctlSock);
